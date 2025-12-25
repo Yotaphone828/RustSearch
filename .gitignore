@@ -1,0 +1,45 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Build outputs
+/debug
+/release
+*.pdb
+
+# Wix installer outputs
+/wix/*.msi
+/wix/*.wixobj
+/wix/*.wixpdb
+/wix/*.cab
+/wix/heat*.wxs
+
+# IDE
+/.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# Temporary folders
+tmp/
+temp/
+AGENTS.md

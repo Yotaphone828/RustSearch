@@ -1,7 +1,7 @@
 [package]
 name = "rust_search"
-version = "0.1.0"
-authors = ["Your Name <your.email@example.com>"]
+version = "0.1.1"
+authors = ["Serral"]
 edition = "2024"
 
 [package.metadata.wix]

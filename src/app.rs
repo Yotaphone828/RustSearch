@@ -196,13 +196,21 @@ impl FileSearchApp {
             if index_seq.load(Ordering::SeqCst) != seq {
                 return;
             }
-            let _ = FileIndexer::save_cache(&cache_path, &entries);
+            {
+                // 先更新内存索引，让搜索尽快可用；缓存写入放到后面，不阻塞“索引完成”的体验
+                let mut indexer_guard = indexer.lock().unwrap();
+                indexer_guard.replace_index(entries, name_index);
+            }
+
             if index_seq.load(Ordering::SeqCst) != seq {
                 return;
             }
 
-            let mut indexer_guard = indexer.lock().unwrap();
-            indexer_guard.replace_index(entries, name_index);
+            let entries_arc = {
+                let indexer_guard = indexer.lock().unwrap();
+                indexer_guard.entries_arc()
+            };
+            let _ = FileIndexer::save_cache(&cache_path, entries_arc.as_slice());
         });
     }
 
@@ -592,7 +600,11 @@ impl FileSearchApp {
 
         ui.separator();
         ui.heading("关于");
-        ui.label("文件搜索工具 v0.1.0");
+        ui.label(format!("文件搜索工具 v{}", env!("CARGO_PKG_VERSION")));
+        ui.label(format!("作者：{}", env!("CARGO_PKG_AUTHORS")));
         ui.label("基于 Rust + egui 构建");
+        ui.separator();
+        ui.label("v0.1.1 更新内容：");
+        ui.label(" - 优化索引缓存机制（缓存更小，旧缓存自动升级）");
     }
 }

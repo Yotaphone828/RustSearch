@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 const CACHE_MAGIC: [u8; 4] = *b"RSIX";
 const CACHE_HEADER_LEN: usize = 8;
 const CACHE_V2: u8 = 2;
+const CACHE_V3: u8 = 3;
 const CACHE_ENCODING_VARINT: u8 = 1;
 
 #[derive(Clone, Debug)]
@@ -19,10 +20,21 @@ pub struct FileEntry {
     pub name_lower: String,
     pub path: String,
     pub path_lower: String,
+    pub drive: u8,
+    pub frn: u64,
+    pub parent_frn: u64,
     pub size: u64,
     pub modified_ms: u64,
     pub is_dir: bool,
     pub is_hidden: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsnDriveState {
+    pub drive: u8,
+    pub journal_id: u64,
+    pub root_frn: u64,
+    pub last_usn: i64,
 }
 
 pub struct FileIndexer {
@@ -31,6 +43,7 @@ pub struct FileIndexer {
     total_files: Arc<AtomicUsize>,
     is_indexing: Arc<AtomicBool>,
     progress: Arc<AtomicUsize>,
+    usn_states: Vec<UsnDriveState>,
 }
 
 #[derive(Clone)]
@@ -71,20 +84,41 @@ struct DiskEntryV2 {
     flags: u8,
 }
 
-#[derive(Serialize)]
-struct IndexCachePayloadV2Ref<'a> {
-    entries: Vec<DiskEntryV2Ref<'a>>,
+#[derive(Serialize, Deserialize)]
+struct IndexCachePayloadV3 {
+    entries: Vec<DiskEntryV3>,
+    usn_states: Vec<UsnDriveState>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskEntryV3 {
+    path: String,
+    size: u64,
+    modified_ms: u64,
+    flags: u8,
+    drive: u8,
+    frn: u64,
+    parent_frn: u64,
 }
 
 #[derive(Serialize)]
-struct DiskEntryV2Ref<'a> {
+struct IndexCachePayloadV3Ref<'a> {
+    entries: Vec<DiskEntryV3Ref<'a>>,
+    usn_states: &'a [UsnDriveState],
+}
+
+#[derive(Serialize)]
+struct DiskEntryV3Ref<'a> {
     path: &'a str,
     size: u64,
     modified_ms: u64,
     flags: u8,
+    drive: u8,
+    frn: u64,
+    parent_frn: u64,
 }
 
-impl<'a> DiskEntryV2Ref<'a> {
+impl<'a> DiskEntryV3Ref<'a> {
     fn from_entry(entry: &'a FileEntry) -> Self {
         let mut flags = 0u8;
         if entry.is_dir {
@@ -98,27 +132,14 @@ impl<'a> DiskEntryV2Ref<'a> {
             size: entry.size,
             modified_ms: entry.modified_ms,
             flags,
+            drive: entry.drive,
+            frn: entry.frn,
+            parent_frn: entry.parent_frn,
         }
     }
 }
 
 impl DiskEntryV2 {
-    fn from_entry(entry: &FileEntry) -> Self {
-        let mut flags = 0u8;
-        if entry.is_dir {
-            flags |= 1 << 0;
-        }
-        if entry.is_hidden {
-            flags |= 1 << 1;
-        }
-        Self {
-            path: entry.path.clone(),
-            size: entry.size,
-            modified_ms: entry.modified_ms,
-            flags,
-        }
-    }
-
     fn to_entry(&self) -> FileEntry {
         let name = file_name_from_normalized_path(&self.path);
         let name_lower = lowercase_for_search(&name);
@@ -128,6 +149,30 @@ impl DiskEntryV2 {
             name_lower,
             path: self.path.clone(),
             path_lower,
+            drive: 0,
+            frn: 0,
+            parent_frn: 0,
+            size: self.size,
+            modified_ms: self.modified_ms,
+            is_dir: (self.flags & (1 << 0)) != 0,
+            is_hidden: (self.flags & (1 << 1)) != 0,
+        }
+    }
+}
+
+impl DiskEntryV3 {
+    fn to_entry(&self) -> FileEntry {
+        let name = file_name_from_normalized_path(&self.path);
+        let name_lower = lowercase_for_search(&name);
+        let path_lower = lowercase_for_search(&self.path);
+        FileEntry {
+            name,
+            name_lower,
+            path: self.path.clone(),
+            path_lower,
+            drive: self.drive,
+            frn: self.frn,
+            parent_frn: self.parent_frn,
             size: self.size,
             modified_ms: self.modified_ms,
             is_dir: (self.flags & (1 << 0)) != 0,
@@ -144,6 +189,7 @@ impl FileIndexer {
             total_files: Arc::new(AtomicUsize::new(0)),
             is_indexing: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AtomicUsize::new(0)),
+            usn_states: Vec::new(),
         }
     }
 
@@ -180,39 +226,98 @@ impl FileIndexer {
         self.total_files.store(0, Ordering::SeqCst);
     }
 
-    pub fn replace_index(
-        &mut self,
-        all_entries: Vec<FileEntry>,
-        name_index: HashMap<String, Vec<usize>>,
-    ) {
+    pub fn replace_index(&mut self, all_entries: Vec<FileEntry>, usn_states: Vec<UsnDriveState>) {
         let count = all_entries.len();
         self.entries = Arc::new(all_entries);
-        self.name_index = name_index;
+        self.name_index = HashMap::new();
+        self.usn_states = usn_states;
         self.total_files.store(count, Ordering::SeqCst);
         self.progress.store(count, Ordering::SeqCst);
         self.is_indexing.store(false, Ordering::SeqCst);
     }
 
-    pub fn set_entries_from_cache(&mut self, entries: Vec<FileEntry>) {
+    pub fn entries_mut(&mut self) -> &mut Vec<FileEntry> {
+        Arc::make_mut(&mut self.entries)
+    }
+
+    pub fn usn_states(&self) -> &[UsnDriveState] {
+        &self.usn_states
+    }
+
+    pub fn usn_states_clone(&self) -> Vec<UsnDriveState> {
+        self.usn_states.clone()
+    }
+
+    pub fn set_cache(&mut self, entries: Vec<FileEntry>, usn_states: Vec<UsnDriveState>) {
         self.entries = Arc::new(entries);
         // 当前 UI 搜索走 `Searcher` 全量扫描，不依赖 `name_index`；
         // 这里避免构建 HashMap 以加速启动/加载缓存。
         self.name_index = HashMap::new();
+        self.usn_states = usn_states;
         self.total_files.store(self.entries.len(), Ordering::SeqCst);
         self.progress.store(self.entries.len(), Ordering::SeqCst);
         self.is_indexing.store(false, Ordering::SeqCst);
     }
 
+    pub fn set_entries_from_cache(&mut self, entries: Vec<FileEntry>) {
+        self.set_cache(entries, Vec::new());
+    }
+
+    #[cfg(windows)]
+    pub fn try_apply_usn_incremental(&mut self, handles: &IndexerHandles) -> std::io::Result<bool> {
+        if self.usn_states.is_empty() || self.entries.is_empty() {
+            self.is_indexing.store(false, Ordering::SeqCst);
+            return Ok(false);
+        }
+
+        let mut usn_states = std::mem::take(&mut self.usn_states);
+        {
+            let entries = self.entries_mut();
+            crate::windows_usn::try_apply_usn_incremental(entries, &mut usn_states, handles)?;
+        }
+        self.usn_states = usn_states;
+
+        let count = self.entries.len();
+        self.total_files.store(count, Ordering::SeqCst);
+        self.progress.store(count, Ordering::SeqCst);
+        self.is_indexing.store(false, Ordering::SeqCst);
+        Ok(true)
+    }
+
     pub fn build_index_snapshot(
         root_paths: Vec<PathBuf>,
         handles: Option<&IndexerHandles>,
-    ) -> (Vec<FileEntry>, HashMap<String, Vec<usize>>) {
+    ) -> (Vec<FileEntry>, Vec<UsnDriveState>) {
         let mut all_entries: Vec<FileEntry> = Vec::new();
+        let mut usn_states: Vec<UsnDriveState> = Vec::new();
         let mut count: usize = 0;
 
         for root_path in &root_paths {
             if !root_path.exists() {
                 continue;
+            }
+
+            #[cfg(windows)]
+            {
+                if crate::windows_usn::is_drive_root(root_path).is_some() {
+                    let is_indexing = handles.map(|h| &*h.is_indexing);
+                    let progress = handles.map(|h| &*h.progress);
+                    if let Ok((mut entries, state)) = crate::windows_usn::try_enumerate_drive_root(
+                        root_path,
+                        count,
+                        is_indexing,
+                        progress,
+                    )
+                    {
+                        count = count.saturating_add(entries.len());
+                        all_entries.append(&mut entries);
+                        usn_states.push(state);
+                        if let Some(handles) = handles {
+                            handles.progress.store(count, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                }
             }
 
             for entry in WalkDir::new(root_path)
@@ -223,7 +328,7 @@ impl FileIndexer {
             {
                 if let Some(handles) = handles {
                     if !handles.is_indexing.load(Ordering::SeqCst) {
-                        return (all_entries, HashMap::new());
+                        return (all_entries, usn_states);
                     }
                 }
 
@@ -251,6 +356,9 @@ impl FileIndexer {
                     name_lower,
                     path: path_str,
                     path_lower,
+                    drive: 0,
+                    frn: 0,
+                    parent_frn: 0,
                     size: metadata.len(),
                     modified_ms: 0,
                     is_dir,
@@ -272,13 +380,13 @@ impl FileIndexer {
             handles.progress.store(count, Ordering::SeqCst);
         }
 
-        (all_entries, HashMap::new())
+        (all_entries, usn_states)
     }
 
-    pub fn load_cache(cache_path: &Path) -> std::io::Result<Vec<FileEntry>> {
+    pub fn load_cache(cache_path: &Path) -> std::io::Result<(Vec<FileEntry>, Vec<UsnDriveState>)> {
         let bytes = std::fs::read(cache_path)?;
         if bytes.len() >= CACHE_HEADER_LEN && bytes.starts_with(&CACHE_MAGIC) {
-            return load_cache_v2(&bytes);
+            return load_cache_with_header(&bytes);
         }
 
         // 兼容旧缓存（v1：纯 bincode + 包含 name_lower/path_lower）
@@ -296,6 +404,9 @@ impl FileIndexer {
                 name_lower: e.name_lower,
                 path: e.path,
                 path_lower: e.path_lower,
+                drive: 0,
+                frn: 0,
+                parent_frn: 0,
                 size: e.size,
                 modified_ms: e.modified_ms,
                 is_dir: e.is_dir,
@@ -303,22 +414,27 @@ impl FileIndexer {
             })
             .collect();
 
-        // 尝试自动升级到更小的 v2 缓存格式（失败则忽略，避免影响启动）
-        let _ = Self::save_cache(cache_path, &entries);
+        // 尝试自动升级到 v3 缓存格式（失败则忽略，避免影响启动）
+        let _ = Self::save_cache(cache_path, &entries, &[]);
 
-        Ok(entries)
+        Ok((entries, Vec::new()))
     }
 
-    pub fn save_cache(cache_path: &Path, entries: &[FileEntry]) -> std::io::Result<()> {
+    pub fn save_cache(
+        cache_path: &Path,
+        entries: &[FileEntry],
+        usn_states: &[UsnDriveState],
+    ) -> std::io::Result<()> {
         if let Some(parent) = cache_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // v2：写入更小的磁盘格式（去掉 name_lower/path_lower 等重复字段）
+        // v3：写入更小的磁盘格式（去掉 name_lower/path_lower 等重复字段），并保存 USN 增量状态（Windows）
         // 文件格式：RSIX(4) + version(u8) + encoding(u8) + reserved(u16) + bincode(payload)
         // 这里用借用版 payload，避免对每个 entry 的 path 做 clone（会显著拖慢大索引的缓存写入）。
-        let payload = IndexCachePayloadV2Ref {
-            entries: entries.iter().map(DiskEntryV2Ref::from_entry).collect(),
+        let payload = IndexCachePayloadV3Ref {
+            entries: entries.iter().map(DiskEntryV3Ref::from_entry).collect(),
+            usn_states,
         };
         let options = bincode::DefaultOptions::new().with_varint_encoding();
         let payload_bytes = options.serialize(&payload).map_err(|e| {
@@ -326,7 +442,7 @@ impl FileIndexer {
         })?;
         let mut bytes = Vec::with_capacity(CACHE_HEADER_LEN + payload_bytes.len());
         bytes.extend_from_slice(&CACHE_MAGIC);
-        bytes.push(CACHE_V2);
+        bytes.push(CACHE_V3);
         bytes.push(CACHE_ENCODING_VARINT);
         bytes.extend_from_slice(&[0, 0]);
         bytes.extend_from_slice(&payload_bytes);
@@ -446,6 +562,9 @@ impl FileIndexer {
                         name_lower,
                         path: path_str,
                         path_lower,
+                        drive: 0,
+                        frn: 0,
+                        parent_frn: 0,
                         size: metadata.len(),
                         modified_ms: 0,
                         is_dir,
@@ -513,6 +632,9 @@ impl FileIndexer {
                     name_lower,
                     path: path_str,
                     path_lower,
+                    drive: 0,
+                    frn: 0,
+                    parent_frn: 0,
                     size: metadata.len(),
                     modified_ms: 0,
                     is_dir,
@@ -551,6 +673,7 @@ fn is_path_hidden(path: &Path, metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
+        let _ = path;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
         const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
         let attrs = metadata.file_attributes();
@@ -566,7 +689,7 @@ fn is_path_hidden(path: &Path, metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-fn load_cache_v2(bytes: &[u8]) -> std::io::Result<Vec<FileEntry>> {
+fn load_cache_with_header(bytes: &[u8]) -> std::io::Result<(Vec<FileEntry>, Vec<UsnDriveState>)> {
     if bytes.len() < CACHE_HEADER_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -582,12 +705,6 @@ fn load_cache_v2(bytes: &[u8]) -> std::io::Result<Vec<FileEntry>> {
 
     let version = bytes[4];
     let encoding = bytes[5];
-    if version != CACHE_V2 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "缓存版本不匹配",
-        ));
-    }
     if encoding != CACHE_ENCODING_VARINT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -597,10 +714,30 @@ fn load_cache_v2(bytes: &[u8]) -> std::io::Result<Vec<FileEntry>> {
 
     let payload_bytes = &bytes[CACHE_HEADER_LEN..];
     let options = bincode::DefaultOptions::new().with_varint_encoding();
-    let payload: IndexCachePayloadV2 = options.deserialize(payload_bytes).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("反序列化失败: {e}"))
-    })?;
-    Ok(payload.entries.into_iter().map(|e| e.to_entry()).collect())
+    match version {
+        CACHE_V2 => {
+            let payload: IndexCachePayloadV2 = options.deserialize(payload_bytes).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("反序列化失败: {e}"))
+            })?;
+            Ok((
+                payload.entries.into_iter().map(|e| e.to_entry()).collect(),
+                Vec::new(),
+            ))
+        }
+        CACHE_V3 => {
+            let payload: IndexCachePayloadV3 = options.deserialize(payload_bytes).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("反序列化失败: {e}"))
+            })?;
+            Ok((
+                payload.entries.into_iter().map(|e| e.to_entry()).collect(),
+                payload.usn_states,
+            ))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "缓存版本不支持",
+        )),
+    }
 }
 
 fn file_name_from_normalized_path(path: &str) -> String {

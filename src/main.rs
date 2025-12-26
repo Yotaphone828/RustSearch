@@ -3,6 +3,8 @@
 mod app;
 mod indexer;
 mod searcher;
+#[cfg(windows)]
+mod windows_usn;
 
 use app::FileSearchApp;
 use eframe::egui::{self, IconData};

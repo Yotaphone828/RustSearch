@@ -122,12 +122,12 @@ impl FileSearchApp {
         if !cache_path.is_file() {
             return false;
         }
-        let Ok(entries) = FileIndexer::load_cache(cache_path) else {
+        let Ok((entries, usn_states)) = FileIndexer::load_cache(cache_path) else {
             return false;
         };
 
         let mut indexer_guard = self.indexer.lock().unwrap();
-        indexer_guard.set_entries_from_cache(entries);
+        indexer_guard.set_cache(entries, usn_states);
         self.cache_loaded = true;
         self.cache_mtime = std::fs::metadata(cache_path).ok().and_then(|m| m.modified().ok());
         true
@@ -192,25 +192,71 @@ impl FileSearchApp {
         };
 
         thread::spawn(move || {
-            let (entries, name_index) = FileIndexer::build_index_snapshot(paths, Some(&handles));
+            // 优先尝试 USN 增量更新（Windows + 已有 USN 状态），失败再全量重建
+            #[cfg(windows)]
+            {
+                if index_seq.load(Ordering::SeqCst) != seq {
+                    return;
+                }
+
+                // 只有在“索引目标是盘符根目录集合”且与缓存内 USN 状态一致时，才做增量更新；
+                // 否则（比如新增了某个子目录路径）必须走全量重建，才能把范围变更纳入索引。
+                let mut requested_drives: Vec<u8> = paths
+                    .iter()
+                    .filter_map(|p| crate::windows_usn::is_drive_root(p).map(|d| d as u8))
+                    .collect();
+                requested_drives.sort_unstable();
+                requested_drives.dedup();
+
+                let mut indexer_guard = indexer.lock().unwrap();
+                let mut cached_drives: Vec<u8> =
+                    indexer_guard.usn_states().iter().map(|s| s.drive).collect();
+                cached_drives.sort_unstable();
+                cached_drives.dedup();
+
+                if !requested_drives.is_empty() && requested_drives == cached_drives {
+                    match indexer_guard.try_apply_usn_incremental(&handles) {
+                        Ok(true) => {
+                            drop(indexer_guard);
+                            if index_seq.load(Ordering::SeqCst) != seq {
+                                return;
+                            }
+                            let (entries_arc, usn_states) = {
+                                let indexer_guard = indexer.lock().unwrap();
+                                (indexer_guard.entries_arc(), indexer_guard.usn_states_clone())
+                            };
+                            let _ = FileIndexer::save_cache(
+                                &cache_path,
+                                entries_arc.as_slice(),
+                                &usn_states,
+                            );
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(_) => {}
+                    }
+                }
+            }
+
+            let (entries, usn_states) = FileIndexer::build_index_snapshot(paths, Some(&handles));
             if index_seq.load(Ordering::SeqCst) != seq {
                 return;
             }
             {
                 // 先更新内存索引，让搜索尽快可用；缓存写入放到后面，不阻塞“索引完成”的体验
                 let mut indexer_guard = indexer.lock().unwrap();
-                indexer_guard.replace_index(entries, name_index);
+                indexer_guard.replace_index(entries, usn_states);
             }
 
             if index_seq.load(Ordering::SeqCst) != seq {
                 return;
             }
 
-            let entries_arc = {
+            let (entries_arc, usn_states) = {
                 let indexer_guard = indexer.lock().unwrap();
-                indexer_guard.entries_arc()
+                (indexer_guard.entries_arc(), indexer_guard.usn_states_clone())
             };
-            let _ = FileIndexer::save_cache(&cache_path, entries_arc.as_slice());
+            let _ = FileIndexer::save_cache(&cache_path, entries_arc.as_slice(), &usn_states);
         });
     }
 
@@ -302,6 +348,9 @@ impl FileSearchApp {
     }
 
     fn format_size(size: u64) -> String {
+        if size == u64::MAX {
+            return "—".to_string();
+        }
         if size < 1024 {
             format!("{} B", size)
         } else if size < 1024 * 1024 {
@@ -606,5 +655,7 @@ impl FileSearchApp {
         ui.separator();
         ui.label("v0.1.1 更新内容：");
         ui.label(" - 优化索引缓存机制（缓存更小，旧缓存自动升级）");
+        ui.label(" - Windows: 使用 USN Journal 加速全盘枚举（NTFS）");
+        ui.label(" - Windows: 使用 USN Journal 增量更新（避免频繁全盘扫描）");
     }
 }

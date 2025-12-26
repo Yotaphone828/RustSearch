@@ -404,7 +404,7 @@ fn fuzzy_match(haystack: &str, needle: &str) -> Option<FuzzyMatch> {
     let mut current = needle_iter.next()?;
 
     let mut first: Option<usize> = None;
-    let mut last: usize = 0;
+    let mut last: Option<usize> = None;
     let mut prev: Option<usize> = None;
     let mut gaps: usize = 0;
 
@@ -420,14 +420,14 @@ fn fuzzy_match(haystack: &str, needle: &str) -> Option<FuzzyMatch> {
             gaps += i.saturating_sub(prev_i + 1);
         }
         prev = Some(i);
-        last = i;
+        last = Some(i);
 
         if let Some(next) = needle_iter.next() {
             current = next;
         } else {
             return Some(FuzzyMatch {
                 first: first.unwrap_or(i),
-                last,
+                last: last.unwrap_or(i),
                 gaps,
             });
         }
@@ -446,6 +446,9 @@ mod tests {
             name_lower: name.to_lowercase(),
             path: path.to_string(),
             path_lower: path.to_lowercase(),
+            drive: 0,
+            frn: 0,
+            parent_frn: 0,
             size: 0,
             modified_ms: 0,
             is_dir: false,

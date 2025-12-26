@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use crate::indexer::FileIndexer;
+use crate::indexer::{FileIndexer, IndexBuildStats, IndexRootSource};
 use crate::searcher::{MatchType, SearchResult, Searcher};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -43,8 +43,14 @@ pub struct FileSearchApp {
     new_path_input: String,  // 新路径输入
     index_seq: Arc<AtomicU64>,
     search_seq: Arc<AtomicU64>,
-    cache_loaded: bool,
-    cache_mtime: Option<SystemTime>,
+    last_index_time: Option<SystemTime>,
+    index_stats: Arc<Mutex<Option<IndexBuildStats>>>,
+    #[cfg(windows)]
+    is_elevated: Option<bool>,
+    #[cfg(windows)]
+    admin_prompt_once: bool,
+    #[cfg(windows)]
+    admin_prompt_open: bool,
 }
 
 impl Default for FileSearchApp {
@@ -72,8 +78,14 @@ impl Default for FileSearchApp {
             new_path_input: String::new(),
             index_seq: Arc::new(AtomicU64::new(0)),
             search_seq: Arc::new(AtomicU64::new(0)),
-            cache_loaded: false,
-            cache_mtime: None,
+            last_index_time: None,
+            index_stats: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
+            is_elevated: None,
+            #[cfg(windows)]
+            admin_prompt_once: false,
+            #[cfg(windows)]
+            admin_prompt_open: false,
         }
     }
 }
@@ -81,56 +93,10 @@ impl Default for FileSearchApp {
 impl FileSearchApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
-
-        let cache_path = Self::index_cache_path();
-        let loaded = app.try_load_index_cache(&cache_path);
-        let stale = loaded && Self::cache_is_stale(&cache_path);
-        if !loaded || stale {
-            app.rebuild_index();
-        }
+        // 不使用本地缓存：启动后直接从 NTFS 的 USN/MFT 枚举构建索引（失败则回退 WalkDir 扫描）。
+        app.rebuild_index();
 
         app
-    }
-
-    fn index_cache_path() -> PathBuf {
-        if cfg!(windows) {
-            if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-                return PathBuf::from(base).join("world_hello").join("index_cache.bin");
-            }
-            if let Some(base) = std::env::var_os("APPDATA") {
-                return PathBuf::from(base).join("world_hello").join("index_cache.bin");
-            }
-        }
-
-        PathBuf::from(".").join("index_cache.bin")
-    }
-
-    fn cache_is_stale(cache_path: &PathBuf) -> bool {
-        let Ok(meta) = std::fs::metadata(cache_path) else {
-            return true;
-        };
-        let Ok(mtime) = meta.modified() else {
-            return true;
-        };
-        let Ok(age) = SystemTime::now().duration_since(mtime) else {
-            return true;
-        };
-        age > Duration::from_secs(24 * 60 * 60)
-    }
-
-    fn try_load_index_cache(&mut self, cache_path: &PathBuf) -> bool {
-        if !cache_path.is_file() {
-            return false;
-        }
-        let Ok((entries, usn_states)) = FileIndexer::load_cache(cache_path) else {
-            return false;
-        };
-
-        let mut indexer_guard = self.indexer.lock().unwrap();
-        indexer_guard.set_cache(entries, usn_states);
-        self.cache_loaded = true;
-        self.cache_mtime = std::fs::metadata(cache_path).ok().and_then(|m| m.modified().ok());
-        true
     }
 
     fn default_index_paths() -> Vec<PathBuf> {
@@ -181,9 +147,9 @@ impl FileSearchApp {
     fn rebuild_index(&mut self) {
         let indexer = Arc::clone(&self.indexer);
         let paths = self.index_paths.clone();
-        let cache_path = Self::index_cache_path();
         let index_seq = Arc::clone(&self.index_seq);
         let seq = index_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let index_stats = Arc::clone(&self.index_stats);
 
         let handles = {
             let indexer_guard = indexer.lock().unwrap();
@@ -192,53 +158,12 @@ impl FileSearchApp {
         };
 
         thread::spawn(move || {
-            // 优先尝试 USN 增量更新（Windows + 已有 USN 状态），失败再全量重建
             #[cfg(windows)]
             {
-                if index_seq.load(Ordering::SeqCst) != seq {
-                    return;
-                }
-
-                // 只有在“索引目标是盘符根目录集合”且与缓存内 USN 状态一致时，才做增量更新；
-                // 否则（比如新增了某个子目录路径）必须走全量重建，才能把范围变更纳入索引。
-                let mut requested_drives: Vec<u8> = paths
-                    .iter()
-                    .filter_map(|p| crate::windows_usn::is_drive_root(p).map(|d| d as u8))
-                    .collect();
-                requested_drives.sort_unstable();
-                requested_drives.dedup();
-
-                let mut indexer_guard = indexer.lock().unwrap();
-                let mut cached_drives: Vec<u8> =
-                    indexer_guard.usn_states().iter().map(|s| s.drive).collect();
-                cached_drives.sort_unstable();
-                cached_drives.dedup();
-
-                if !requested_drives.is_empty() && requested_drives == cached_drives {
-                    match indexer_guard.try_apply_usn_incremental(&handles) {
-                        Ok(true) => {
-                            drop(indexer_guard);
-                            if index_seq.load(Ordering::SeqCst) != seq {
-                                return;
-                            }
-                            let (entries_arc, usn_states) = {
-                                let indexer_guard = indexer.lock().unwrap();
-                                (indexer_guard.entries_arc(), indexer_guard.usn_states_clone())
-                            };
-                            let _ = FileIndexer::save_cache(
-                                &cache_path,
-                                entries_arc.as_slice(),
-                                &usn_states,
-                            );
-                            return;
-                        }
-                        Ok(false) => {}
-                        Err(_) => {}
-                    }
-                }
+                let _ = crate::windows_usn::try_enable_usn_privileges();
             }
-
-            let (entries, usn_states) = FileIndexer::build_index_snapshot(paths, Some(&handles));
+            let (entries, usn_states, stats) =
+                FileIndexer::build_index_snapshot_with_stats(paths, Some(&handles));
             if index_seq.load(Ordering::SeqCst) != seq {
                 return;
             }
@@ -247,17 +172,10 @@ impl FileSearchApp {
                 let mut indexer_guard = indexer.lock().unwrap();
                 indexer_guard.replace_index(entries, usn_states);
             }
-
-            if index_seq.load(Ordering::SeqCst) != seq {
-                return;
-            }
-
-            let (entries_arc, usn_states) = {
-                let indexer_guard = indexer.lock().unwrap();
-                (indexer_guard.entries_arc(), indexer_guard.usn_states_clone())
-            };
-            let _ = FileIndexer::save_cache(&cache_path, entries_arc.as_slice(), &usn_states);
+            let mut guard = index_stats.lock().unwrap();
+            *guard = Some(stats);
         });
+        self.last_index_time = Some(SystemTime::now());
     }
 
     fn perform_search(&mut self) {
@@ -396,6 +314,59 @@ impl eframe::App for FileSearchApp {
                 Tab::Settings => self.show_settings_tab(ui),
             }
         });
+
+        #[cfg(windows)]
+        {
+            // 若 USN 枚举因权限(code=5)回退到 WalkDir，则主动提示一次可重启为管理员。
+            if !self.admin_prompt_once {
+                let elevated = match self.is_elevated {
+                    Some(v) => v,
+                    None => {
+                        let v = crate::windows_usn::is_process_elevated().unwrap_or(false);
+                        self.is_elevated = Some(v);
+                        v
+                    }
+                };
+
+                if !elevated {
+                    if let Some(stats) = self.index_stats.lock().unwrap().clone() {
+                        let needs_admin = stats.roots.iter().any(|r| {
+                            r.note
+                                .as_deref()
+                                .is_some_and(|n| n.contains("code=5"))
+                        });
+                        if needs_admin {
+                            self.admin_prompt_once = true;
+                            self.admin_prompt_open = true;
+                        }
+                    }
+                } else {
+                    self.admin_prompt_once = true;
+                }
+            }
+
+            if self.admin_prompt_open {
+                egui::Window::new("需要管理员权限")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label("检测到 USN/MFT 枚举被拒绝访问（code=5），已回退为 WalkDir 全盘扫描，因此索引会很慢。");
+                        ui.label("是否现在以管理员身份重启以启用快速索引？");
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("以管理员身份重启").clicked() {
+                                if crate::windows_usn::relaunch_as_admin().is_ok() {
+                                    std::process::exit(0);
+                                }
+                            }
+                            if ui.button("继续（慢）").clicked() {
+                                self.admin_prompt_open = false;
+                            }
+                        });
+                    });
+            }
+        }
     }
 }
 
@@ -533,11 +504,11 @@ impl FileSearchApp {
                     }
 
                     if response.double_clicked() {
-                        Self::open_path_in_os(&entry.path);
+                        Self::open_path_in_os(&result.display_path);
                     }
 
                     // 路径提示
-                    response.on_hover_text(&entry.path);
+                    response.on_hover_text(&result.display_path);
                 }
             });
 
@@ -549,12 +520,12 @@ impl FileSearchApp {
                 if let Some(result) = results.get(idx) {
                     let resp = ui
                         .add(
-                            egui::Label::new(format!("选中: {}", result.entry.path))
+                            egui::Label::new(format!("选中: {}", result.display_path))
                                 .sense(egui::Sense::click()),
                         )
                         .on_hover_text("双击打开");
                     if resp.double_clicked() {
-                        Self::open_path_in_os(&result.entry.path);
+                        Self::open_path_in_os(&result.display_path);
                     }
                 }
             }
@@ -564,18 +535,55 @@ impl FileSearchApp {
     fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("索引设置");
 
-        ui.label(format!("缓存文件: {}", Self::index_cache_path().display()));
-        if self.cache_loaded {
-            ui.label("缓存: 已加载（用于加速启动）");
-            if let Some(t) = self.cache_mtime {
-                if let Ok(age) = SystemTime::now().duration_since(t) {
-                    ui.label(format!("缓存时间: {} 分钟前", age.as_secs() / 60));
+        ui.label("索引来源: Windows (NTFS) 通过 USN/MFT 枚举（无本地索引缓存）");
+        if let Some(t) = self.last_index_time {
+            if let Ok(age) = SystemTime::now().duration_since(t) {
+                ui.label(format!("上次开始索引: {} 秒前", age.as_secs()));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let elevated = match self.is_elevated {
+                Some(v) => v,
+                None => {
+                    let v = crate::windows_usn::is_process_elevated().unwrap_or(false);
+                    self.is_elevated = Some(v);
+                    v
+                }
+            };
+            ui.label(format!("管理员权限: {}", if elevated { "是" } else { "否" }));
+            if !elevated {
+                if ui.button("以管理员身份重启（启用快速索引）").clicked() {
+                    if crate::windows_usn::relaunch_as_admin().is_ok() {
+                        std::process::exit(0);
+                    }
                 }
             }
-        } else {
-            ui.label("缓存: 未加载（首次运行会较慢）");
+            ui.separator();
         }
-        ui.label("缓存自动过期: 24 小时");
+
+        if let Some(stats) = self.index_stats.lock().unwrap().clone() {
+            ui.label(format!("本次统计: 共 {} 项，用时 {} ms", stats.total_entries, stats.total_ms));
+            ui.separator();
+            ui.label("分路径统计（USN=快，WalkDir=慢/回退）：");
+            for r in stats.roots {
+                let src = match r.source {
+                    IndexRootSource::Usn => "USN",
+                    IndexRootSource::WalkDir => "WalkDir",
+                };
+                if let Some(note) = r.note {
+                    ui.label(format!(
+                        "- {src}: {} | {} 项 | {} ms | {}",
+                        r.root, r.entries, r.duration_ms, note
+                    ));
+                } else {
+                    ui.label(format!(
+                        "- {src}: {} | {} 项 | {} ms",
+                        r.root, r.entries, r.duration_ms
+                    ));
+                }
+            }
+        }
 
         ui.horizontal(|ui| {
             if ui.button("自动索引全部磁盘").clicked() {
@@ -653,9 +661,9 @@ impl FileSearchApp {
         ui.label(format!("作者：{}", env!("CARGO_PKG_AUTHORS")));
         ui.label("基于 Rust + egui 构建");
         ui.separator();
-        ui.label("v0.1.1 更新内容：");
-        ui.label(" - 优化索引缓存机制（缓存更小，旧缓存自动升级）");
-        ui.label(" - Windows: 使用 USN Journal 加速全盘枚举（NTFS）");
-        ui.label(" - Windows: 使用 USN Journal 增量更新（避免频繁全盘扫描）");
+        ui.label("v0.1.2 更新内容：");
+        ui.label(" - Windows: 基于 USN/MFT 枚举");
+        ui.label(" - 启动后直接重建索引，不写入本地缓存文件");
+        ui.label(" - 为加速启动，路径按需解析（展示/打开时再拼接）");
     }
 }

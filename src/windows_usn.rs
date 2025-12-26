@@ -13,13 +13,20 @@ use winapi::shared::ntdef::HANDLE;
 use winapi::um::fileapi::{CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
 use winapi::um::ioapiset::DeviceIoControl;
+use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+use winapi::um::securitybaseapi::{AdjustTokenPrivileges, GetTokenInformation};
+use winapi::um::shellapi::ShellExecuteW;
+use winapi::um::winbase::LookupPrivilegeValueW;
 use winapi::um::winnt::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, LUID, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation,
 };
 
 const OPEN_EXISTING: DWORD = 3;
 const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
+const ERROR_NOT_ALL_ASSIGNED: i32 = 1300;
+const SW_SHOWNORMAL: i32 = 1;
 
 // 来自 winioctl.h 的常量值（避免依赖 winapi 的 winioctl feature/符号差异）
 const FSCTL_QUERY_USN_JOURNAL: DWORD = 0x0009_00F4;
@@ -77,12 +84,6 @@ struct READ_USN_JOURNAL_DATA_V0 {
     usn_journal_id: u64,
 }
 
-struct Node {
-    parent: u64,
-    name: String,
-    attrs: DWORD,
-}
-
 struct UsnEvent {
     frn: u64,
     parent_frn: u64,
@@ -110,6 +111,114 @@ pub fn try_apply_usn_incremental(
     }
 
     Ok(())
+}
+
+pub fn try_enable_usn_privileges() -> io::Result<bool> {
+    // 需要的特权一般只有管理员令牌才具备；这里做“尽力启用”，失败不影响后续回退 WalkDir。
+    unsafe {
+        let mut token: HANDLE = ptr::null_mut();
+        let ok = OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token as *mut _,
+        );
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut all_assigned = true;
+        for name in ["SeManageVolumePrivilege", "SeBackupPrivilege", "SeRestorePrivilege"] {
+            let mut luid: LUID = std::mem::zeroed();
+            let wide = to_wide_null(name);
+            let ok = LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), &mut luid as *mut _);
+            if ok == 0 {
+                continue;
+            }
+
+            let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+            let ok = AdjustTokenPrivileges(
+                token,
+                0,
+                &mut tp as *mut _,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            if ok == 0 {
+                continue;
+            }
+
+            let last = io::Error::last_os_error();
+            if last.raw_os_error() == Some(ERROR_NOT_ALL_ASSIGNED) {
+                all_assigned = false;
+            }
+        }
+
+        CloseHandle(token);
+        Ok(all_assigned)
+    }
+}
+
+pub fn is_process_elevated() -> io::Result<bool> {
+    unsafe {
+        let mut token: HANDLE = ptr::null_mut();
+        let ok = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token as *mut _);
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut ret_len: DWORD = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as LPVOID,
+            std::mem::size_of::<TOKEN_ELEVATION>() as DWORD,
+            &mut ret_len as *mut _,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+pub fn relaunch_as_admin() -> io::Result<bool> {
+    let exe = std::env::current_exe()?;
+    let exe_str = exe.to_string_lossy().to_string();
+    let cwd = std::env::current_dir().ok().map(|d| d.to_string_lossy().to_string());
+
+    // 该项目目前没有 CLI 参数需求；这里不传参数，避免引入复杂的 Windows 命令行转义问题。
+    let verb = to_wide_null("runas");
+    let file = to_wide_null(&exe_str);
+    let dir_wide = cwd.as_deref().map(to_wide_null);
+
+    unsafe {
+        let h = ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            ptr::null(),
+            dir_wide
+                .as_ref()
+                .map(|v| v.as_ptr())
+                .unwrap_or(ptr::null()),
+            SW_SHOWNORMAL,
+        );
+        let code = h as isize;
+        if code <= 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("请求管理员权限失败（ShellExecuteW 返回 {code}）"),
+            ));
+        }
+        Ok(true)
+    }
 }
 
 pub fn is_drive_root(path: &Path) -> Option<char> {
@@ -153,7 +262,7 @@ pub fn try_enumerate_drive_root(
     // 1MB 缓冲区：在大盘上可减少 ioctl 次数
     let mut buffer = vec![0u8; 1024 * 1024];
 
-    let mut nodes: HashMap<u64, Node> = HashMap::new();
+    let mut entries: Vec<FileEntry> = Vec::new();
     let mut seen = 0usize;
 
     loop {
@@ -234,14 +343,25 @@ pub fn try_enumerate_drive_root(
                 let name_slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len_u16) };
                 let name = String::from_utf16_lossy(name_slice);
                 if !name.is_empty() {
-                    nodes.insert(
-                        frn,
-                        Node {
-                            parent,
+                    if frn != root_frn {
+                        let name_lower = lowercase_for_search(&name);
+                        let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                        let is_hidden =
+                            (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0;
+                        entries.push(FileEntry {
                             name,
-                            attrs,
-                        },
-                    );
+                            name_lower,
+                            path: String::new(),
+                            path_lower: String::new(),
+                            drive: drive as u8,
+                            frn,
+                            parent_frn: parent,
+                            size: u64::MAX,
+                            modified_ms: 0,
+                            is_dir,
+                            is_hidden,
+                        });
+                    }
                     seen += 1;
                     if seen % 50_000 == 0 {
                         if let Some(p) = progress {
@@ -257,38 +377,6 @@ pub fn try_enumerate_drive_root(
 
     unsafe {
         CloseHandle(volume_handle);
-    }
-
-    let mut path_cache: HashMap<u64, String> = HashMap::new();
-    path_cache.insert(root_frn, format!("{drive}:/"));
-
-    let mut entries: Vec<FileEntry> = Vec::with_capacity(nodes.len());
-    for (frn, node) in nodes.iter() {
-        if *frn == root_frn {
-            continue;
-        }
-        let Some(full_path) = build_full_path(*frn, root_frn, drive, &nodes, &mut path_cache) else {
-            continue;
-        };
-
-        let name_lower = lowercase_for_search(&node.name);
-        let path_lower = lowercase_for_search(&full_path);
-        let is_dir = (node.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        let is_hidden = (node.attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0;
-
-        entries.push(FileEntry {
-            name: node.name.clone(),
-            name_lower,
-            path: full_path,
-            path_lower,
-            drive: drive as u8,
-            frn: *frn,
-            parent_frn: node.parent,
-            size: u64::MAX,
-            modified_ms: 0,
-            is_dir,
-            is_hidden,
-        });
     }
 
     if let Some(p) = progress {
@@ -735,60 +823,6 @@ fn query_root_frn(drive: char) -> io::Result<u64> {
     Ok(((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64))
 }
 
-fn build_full_path(
-    frn: u64,
-    root_frn: u64,
-    drive: char,
-    nodes: &HashMap<u64, Node>,
-    cache: &mut HashMap<u64, String>,
-) -> Option<String> {
-    if let Some(path) = cache.get(&frn) {
-        return Some(path.clone());
-    }
-
-    let mut chain: Vec<u64> = Vec::new();
-    let mut cur = frn;
-    let mut depth = 0usize;
-
-    let base = loop {
-        if let Some(p) = cache.get(&cur) {
-            break p.clone();
-        }
-        if cur == root_frn {
-            break format!("{drive}:/");
-        }
-
-        let node = nodes.get(&cur)?;
-        chain.push(cur);
-
-        if node.parent == 0 || node.parent == cur {
-            break format!("{drive}:/");
-        }
-
-        cur = node.parent;
-        depth += 1;
-        if depth > 4096 {
-            return None;
-        }
-    };
-
-    let mut path = base;
-    for id in chain.iter().rev() {
-        if *id == root_frn {
-            cache.insert(*id, format!("{drive}:/"));
-            continue;
-        }
-        let node = nodes.get(id)?;
-        if !path.ends_with('/') {
-            path.push('/');
-        }
-        path.push_str(&node.name);
-        cache.insert(*id, path.clone());
-    }
-
-    cache.get(&frn).cloned()
-}
-
 fn to_wide_null(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()
@@ -797,9 +831,16 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 }
 
 fn lowercase_for_search(s: &str) -> String {
-    if s.is_ascii() {
-        s.to_ascii_lowercase()
-    } else {
-        s.to_lowercase()
+    if !s.is_ascii() {
+        return String::new();
     }
+
+    let bytes = s.as_bytes();
+    if !bytes.iter().any(|b| (b'A'..=b'Z').contains(b)) {
+        return String::new();
+    }
+
+    let mut out = s.to_string();
+    out.make_ascii_lowercase();
+    out
 }

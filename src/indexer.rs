@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 use bincode::Options;
@@ -44,7 +47,69 @@ pub struct FileIndexer {
     is_indexing: Arc<AtomicBool>,
     progress: Arc<AtomicUsize>,
     usn_states: Vec<UsnDriveState>,
+    #[cfg(windows)]
+    windows_dir_index: WindowsDirIndex,
 }
+
+#[derive(Clone, Debug)]
+pub enum IndexRootSource {
+    Usn,
+    WalkDir,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexRootStats {
+    pub root: String,
+    pub source: IndexRootSource,
+    pub duration_ms: u128,
+    pub entries: usize,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IndexBuildStats {
+    pub total_ms: u128,
+    pub total_entries: usize,
+    pub roots: Vec<IndexRootStats>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsDirHasher(u64);
+
+#[cfg(windows)]
+impl Hasher for WindowsDirHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut x = self.0;
+        for &b in bytes {
+            x ^= b as u64;
+            x = x.wrapping_mul(0x100_0000_01B3);
+        }
+        self.0 = x;
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        let mut x = i ^ self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+        x ^= x >> 33;
+        self.0 = x;
+    }
+
+    fn write_u128(&mut self, i: u128) {
+        self.write_u64((i >> 64) as u64);
+        self.write_u64(i as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+type WindowsDirIndex = HashMap<u128, usize, BuildHasherDefault<WindowsDirHasher>>;
 
 #[derive(Clone)]
 pub struct IndexerHandles {
@@ -142,8 +207,8 @@ impl<'a> DiskEntryV3Ref<'a> {
 impl DiskEntryV2 {
     fn to_entry(&self) -> FileEntry {
         let name = file_name_from_normalized_path(&self.path);
-        let name_lower = lowercase_for_search(&name);
-        let path_lower = lowercase_for_search(&self.path);
+        let name_lower = lowercase_for_index_field(&name);
+        let path_lower = lowercase_for_index_field(&self.path);
         FileEntry {
             name,
             name_lower,
@@ -163,8 +228,8 @@ impl DiskEntryV2 {
 impl DiskEntryV3 {
     fn to_entry(&self) -> FileEntry {
         let name = file_name_from_normalized_path(&self.path);
-        let name_lower = lowercase_for_search(&name);
-        let path_lower = lowercase_for_search(&self.path);
+        let name_lower = lowercase_for_index_field(&name);
+        let path_lower = lowercase_for_index_field(&self.path);
         FileEntry {
             name,
             name_lower,
@@ -190,6 +255,8 @@ impl FileIndexer {
             is_indexing: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AtomicUsize::new(0)),
             usn_states: Vec::new(),
+            #[cfg(windows)]
+            windows_dir_index: WindowsDirIndex::default(),
         }
     }
 
@@ -231,6 +298,8 @@ impl FileIndexer {
         self.entries = Arc::new(all_entries);
         self.name_index = HashMap::new();
         self.usn_states = usn_states;
+        #[cfg(windows)]
+        self.rebuild_windows_dir_index();
         self.total_files.store(count, Ordering::SeqCst);
         self.progress.store(count, Ordering::SeqCst);
         self.is_indexing.store(false, Ordering::SeqCst);
@@ -254,6 +323,8 @@ impl FileIndexer {
         // 这里避免构建 HashMap 以加速启动/加载缓存。
         self.name_index = HashMap::new();
         self.usn_states = usn_states;
+        #[cfg(windows)]
+        self.rebuild_windows_dir_index();
         self.total_files.store(self.entries.len(), Ordering::SeqCst);
         self.progress.store(self.entries.len(), Ordering::SeqCst);
         self.is_indexing.store(false, Ordering::SeqCst);
@@ -288,17 +359,17 @@ impl FileIndexer {
         root_paths: Vec<PathBuf>,
         handles: Option<&IndexerHandles>,
     ) -> (Vec<FileEntry>, Vec<UsnDriveState>) {
-        let mut all_entries: Vec<FileEntry> = Vec::new();
-        let mut usn_states: Vec<UsnDriveState> = Vec::new();
-        let mut count: usize = 0;
+        #[cfg(windows)]
+        {
+            let mut all_entries: Vec<FileEntry> = Vec::new();
+            let mut usn_states: Vec<UsnDriveState> = Vec::new();
+            let mut count: usize = 0;
 
-        for root_path in &root_paths {
-            if !root_path.exists() {
-                continue;
-            }
+            for root_path in &root_paths {
+                if !root_path.exists() {
+                    continue;
+                }
 
-            #[cfg(windows)]
-            {
                 if crate::windows_usn::is_drive_root(root_path).is_some() {
                     let is_indexing = handles.map(|h| &*h.is_indexing);
                     let progress = handles.map(|h| &*h.progress);
@@ -307,8 +378,7 @@ impl FileIndexer {
                         count,
                         is_indexing,
                         progress,
-                    )
-                    {
+                    ) {
                         count = count.saturating_add(entries.len());
                         all_entries.append(&mut entries);
                         usn_states.push(state);
@@ -318,69 +388,247 @@ impl FileIndexer {
                         continue;
                     }
                 }
+
+                append_walkdir_entries_for_paths(&[root_path.clone()], handles, &mut count, &mut all_entries);
             }
 
-            for entry in WalkDir::new(root_path)
-                .follow_links(false)
-                .same_file_system(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if let Some(handles) = handles {
-                    if !handles.is_indexing.load(Ordering::SeqCst) {
-                        return (all_entries, usn_states);
+            if let Some(handles) = handles {
+                handles.progress.store(count, Ordering::SeqCst);
+            }
+
+            return (all_entries, usn_states);
+        }
+
+        #[cfg(not(windows))]
+        {
+            return build_index_snapshot_walkdir(&root_paths, handles);
+        }
+    }
+
+    pub fn build_index_snapshot_with_stats(
+        root_paths: Vec<PathBuf>,
+        handles: Option<&IndexerHandles>,
+    ) -> (Vec<FileEntry>, Vec<UsnDriveState>, IndexBuildStats) {
+        #[cfg(windows)]
+        {
+            let mut stats = IndexBuildStats::default();
+            let total_start = Instant::now();
+
+            let mut all_entries: Vec<FileEntry> = Vec::new();
+            let mut usn_states: Vec<UsnDriveState> = Vec::new();
+            let mut count: usize = 0;
+
+            for root_path in &root_paths {
+                if !root_path.exists() {
+                    continue;
+                }
+
+                let root_display = root_path.to_string_lossy().to_string();
+                if crate::windows_usn::is_drive_root(root_path).is_some() {
+                    let start = Instant::now();
+                    let is_indexing = handles.map(|h| &*h.is_indexing);
+                    let progress = handles.map(|h| &*h.progress);
+                    match crate::windows_usn::try_enumerate_drive_root(
+                        root_path,
+                        count,
+                        is_indexing,
+                        progress,
+                    ) {
+                        Ok((mut entries, state)) => {
+                            let appended = entries.len();
+                            count = count.saturating_add(appended);
+                            all_entries.append(&mut entries);
+                            usn_states.push(state);
+                            if let Some(handles) = handles {
+                                handles.progress.store(count, Ordering::SeqCst);
+                            }
+                            stats.roots.push(IndexRootStats {
+                                root: root_display,
+                                source: IndexRootSource::Usn,
+                                duration_ms: start.elapsed().as_millis(),
+                                entries: appended,
+                                note: None,
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            let note = format!(
+                                "USN 枚举失败: {e}{}{}",
+                                e.raw_os_error()
+                                    .map(|c| format!(" (code={c})"))
+                                    .unwrap_or_default()
+                                ,
+                                if e.raw_os_error() == Some(5) {
+                                    "；请尝试以管理员身份运行（需要卷管理权限）"
+                                } else {
+                                    ""
+                                }
+                            );
+                            let before = all_entries.len();
+                            append_walkdir_entries_for_paths(
+                                &[root_path.clone()],
+                                handles,
+                                &mut count,
+                                &mut all_entries,
+                            );
+                            let appended = all_entries.len().saturating_sub(before);
+                            stats.roots.push(IndexRootStats {
+                                root: root_display,
+                                source: IndexRootSource::WalkDir,
+                                duration_ms: start.elapsed().as_millis(),
+                                entries: appended,
+                                note: Some(note),
+                            });
+                            continue;
+                        }
                     }
                 }
 
-                let path = entry.path();
-                let metadata = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
+                let start = Instant::now();
+                let before = all_entries.len();
+                append_walkdir_entries_for_paths(
+                    &[root_path.clone()],
+                    handles,
+                    &mut count,
+                    &mut all_entries,
+                );
+                let appended = all_entries.len().saturating_sub(before);
+                stats.roots.push(IndexRootStats {
+                    root: root_display,
+                    source: IndexRootSource::WalkDir,
+                    duration_ms: start.elapsed().as_millis(),
+                    entries: appended,
+                    note: None,
+                });
+            }
 
-                let is_dir = metadata.is_dir();
-                let is_hidden = is_path_hidden(path, &metadata);
+            if let Some(handles) = handles {
+                handles.progress.store(count, Ordering::SeqCst);
+            }
 
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
+            stats.total_ms = total_start.elapsed().as_millis();
+            stats.total_entries = all_entries.len();
+            return (all_entries, usn_states, stats);
+        }
 
-                let path_str = path.to_string_lossy().replace("\\", "/");
-                let name_lower = lowercase_for_search(&name);
-                let path_lower = lowercase_for_search(&path_str);
-
-                let file_entry = FileEntry {
-                    name,
-                    name_lower,
-                    path: path_str,
-                    path_lower,
-                    drive: 0,
-                    frn: 0,
-                    parent_frn: 0,
-                    size: metadata.len(),
-                    modified_ms: 0,
-                    is_dir,
-                    is_hidden,
-                };
-
-                all_entries.push(file_entry);
-
-                count += 1;
-                if count % 1000 == 0 {
-                    if let Some(handles) = handles {
-                        handles.progress.store(count, Ordering::SeqCst);
-                    }
+        #[cfg(not(windows))]
+        {
+            let mut stats = IndexBuildStats::default();
+            let total_start = Instant::now();
+            let mut all_entries: Vec<FileEntry> = Vec::new();
+            let mut count: usize = 0;
+            for root_path in &root_paths {
+                if !root_path.exists() {
+                    continue;
                 }
+                let start = Instant::now();
+                let before = all_entries.len();
+                append_walkdir_entries_for_paths(
+                    &[root_path.clone()],
+                    handles,
+                    &mut count,
+                    &mut all_entries,
+                );
+                let appended = all_entries.len().saturating_sub(before);
+                stats.roots.push(IndexRootStats {
+                    root: root_path.to_string_lossy().to_string(),
+                    source: IndexRootSource::WalkDir,
+                    duration_ms: start.elapsed().as_millis(),
+                    entries: appended,
+                    note: None,
+                });
+            }
+            if let Some(handles) = handles {
+                handles.progress.store(count, Ordering::SeqCst);
+            }
+            stats.total_ms = total_start.elapsed().as_millis();
+            stats.total_entries = all_entries.len();
+            (all_entries, Vec::new(), stats)
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn display_path_for(&self, entry: &FileEntry) -> String {
+        if !entry.path.is_empty() {
+            return entry.path.clone();
+        }
+
+        if entry.drive == 0 || entry.frn == 0 {
+            return entry.path.clone();
+        }
+
+        let Some(root_frn) = self
+            .usn_states
+            .iter()
+            .find(|s| s.drive == entry.drive)
+            .map(|s| s.root_frn)
+        else {
+            let drive = entry.drive as char;
+            if entry.name.is_empty() {
+                return format!("{drive}:/");
+            }
+            return format!("{drive}:/{name}", name = entry.name);
+        };
+
+        let drive = entry.drive as char;
+        if entry.frn == root_frn || entry.name.is_empty() {
+            return format!("{drive}:/");
+        }
+
+        let mut parts: Vec<&str> = Vec::new();
+        parts.push(entry.name.as_str());
+
+        let mut cur = entry.parent_frn;
+        let mut depth = 0usize;
+        while cur != 0 && cur != root_frn {
+            let key = windows_key(entry.drive, cur);
+            let Some(&idx) = self.windows_dir_index.get(&key) else {
+                break;
+            };
+            let dir = &self.entries[idx];
+            if dir.name.is_empty() {
+                break;
+            }
+            parts.push(dir.name.as_str());
+            cur = dir.parent_frn;
+
+            depth += 1;
+            if depth > 4096 {
+                break;
             }
         }
 
-        if let Some(handles) = handles {
-            handles.progress.store(count, Ordering::SeqCst);
+        let mut path = String::new();
+        path.push(drive);
+        path.push_str(":/");
+        for (i, part) in parts.iter().rev().enumerate() {
+            if i > 0 {
+                path.push('/');
+            }
+            path.push_str(part);
         }
+        path
+    }
 
-        (all_entries, usn_states)
+    #[cfg(not(windows))]
+    pub fn display_path_for(&self, entry: &FileEntry) -> String {
+        entry.path.clone()
+    }
+
+    #[cfg(windows)]
+    fn rebuild_windows_dir_index(&mut self) {
+        self.windows_dir_index.clear();
+        self.windows_dir_index
+            .reserve(self.entries.len().saturating_div(8).max(1024));
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.drive == 0 || entry.frn == 0 {
+                continue;
+            }
+            if !entry.is_dir {
+                continue;
+            }
+            self.windows_dir_index.insert(windows_key(entry.drive, entry.frn), idx);
+        }
     }
 
     pub fn load_cache(cache_path: &Path) -> std::io::Result<(Vec<FileEntry>, Vec<UsnDriveState>)> {
@@ -471,6 +719,8 @@ impl FileIndexer {
         if self.name_index.is_empty() {
             for entry in self.entries.iter() {
                 let haystack = if case_sensitive {
+                    entry.name.as_str()
+                } else if entry.name_lower.is_empty() {
                     entry.name.as_str()
                 } else {
                     entry.name_lower.as_str()
@@ -663,6 +913,92 @@ impl FileIndexer {
     }
 }
 
+fn build_index_snapshot_walkdir(
+    root_paths: &[PathBuf],
+    handles: Option<&IndexerHandles>,
+) -> (Vec<FileEntry>, Vec<UsnDriveState>) {
+    let mut all_entries: Vec<FileEntry> = Vec::new();
+    let mut count: usize = 0;
+    append_walkdir_entries_for_paths(root_paths, handles, &mut count, &mut all_entries);
+    if let Some(handles) = handles {
+        handles.progress.store(count, Ordering::SeqCst);
+    }
+    (all_entries, Vec::new())
+}
+
+fn append_walkdir_entries_for_paths(
+    root_paths: &[PathBuf],
+    handles: Option<&IndexerHandles>,
+    count: &mut usize,
+    out: &mut Vec<FileEntry>,
+) {
+    for root_path in root_paths {
+        if !root_path.exists() {
+            continue;
+        }
+
+        for entry in WalkDir::new(root_path)
+            .follow_links(false)
+            .same_file_system(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if let Some(handles) = handles {
+                if !handles.is_indexing.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+
+            let path = entry.path();
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let is_dir = metadata.is_dir();
+            let is_hidden = is_path_hidden(path, &metadata);
+
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            let path_str = path.to_string_lossy().replace("\\", "/");
+            let name_lower = lowercase_for_index_field(&name);
+            let path_lower = lowercase_for_index_field(&path_str);
+
+            let file_entry = FileEntry {
+                name,
+                name_lower,
+                path: path_str,
+                path_lower,
+                drive: 0,
+                frn: 0,
+                parent_frn: 0,
+                size: metadata.len(),
+                modified_ms: 0,
+                is_dir,
+                is_hidden,
+            };
+
+            out.push(file_entry);
+
+            *count = count.saturating_add(1);
+            if *count % 1000 == 0 {
+                if let Some(handles) = handles {
+                    handles.progress.store(*count, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_key(drive: u8, frn: u64) -> u128 {
+    ((drive as u128) << 64) | (frn as u128)
+}
+
 impl Default for FileIndexer {
     fn default() -> Self {
         Self::new()
@@ -758,4 +1094,17 @@ fn lowercase_for_search(s: &str) -> String {
     } else {
         s.to_lowercase()
     }
+}
+
+fn lowercase_for_index_field(s: &str) -> String {
+    if !s.is_ascii() {
+        return String::new();
+    }
+    let bytes = s.as_bytes();
+    if !bytes.iter().any(|b| (b'A'..=b'Z').contains(b)) {
+        return String::new();
+    }
+    let mut out = s.to_string();
+    out.make_ascii_lowercase();
+    out
 }

@@ -26,6 +26,7 @@ impl Default for SearchOptions {
 
 pub struct SearchResult {
     pub entry: Arc<FileEntry>,
+    pub display_path: String,
     pub score: f32,
     pub match_type: MatchType,
 }
@@ -133,12 +134,13 @@ impl Searcher {
 
         for (entry_idx, entry) in entries.iter().enumerate() {
             if self.options.path_search {
+                let path = indexer.display_path_for(entry);
                 let haystack = if self.options.case_sensitive {
-                    entry.path.as_str()
+                    path
                 } else {
-                    entry.path_lower.as_str()
+                    path.to_lowercase()
                 };
-                if let Some(score) = self.tokens_score(haystack, &tokens) {
+                if let Some(score) = self.tokens_score(haystack.as_str(), &tokens) {
                     self.push_top_k(
                         &mut heap,
                         keep,
@@ -154,7 +156,11 @@ impl Searcher {
             let name_haystack = if self.options.case_sensitive {
                 entry.name.as_str()
             } else {
-                entry.name_lower.as_str()
+                if entry.name_lower.is_empty() {
+                    entry.name.as_str()
+                } else {
+                    entry.name_lower.as_str()
+                }
             };
             if let Some(score) = self.tokens_score(name_haystack, &tokens) {
                 self.push_top_k(
@@ -168,25 +174,36 @@ impl Searcher {
                 continue;
             }
 
-            let path_haystack = if self.options.case_sensitive {
-                entry.path.as_str()
-            } else {
-                entry.path_lower.as_str()
-            };
-            if let Some(score) = self.tokens_score(path_haystack, &tokens) {
-                self.push_top_k(
-                    &mut heap,
-                    keep,
-                    entry_idx,
-                    entry,
-                    score,
-                    MatchType::Path,
-                );
+            // Windows 的 NTFS 枚举默认不预先构建全路径（否则会非常慢）；
+            // 因此在“非路径搜索模式”下，只有当 entry 自带路径时才参与路径匹配。
+            if !entry.path.is_empty() {
+                let path_haystack = if self.options.case_sensitive {
+                    entry.path.as_str()
+                } else {
+                    if entry.path_lower.is_empty() {
+                        entry.path.as_str()
+                    } else {
+                        entry.path_lower.as_str()
+                    }
+                };
+                if let Some(score) = self.tokens_score(path_haystack, &tokens) {
+                    self.push_top_k(
+                        &mut heap,
+                        keep,
+                        entry_idx,
+                        entry,
+                        score,
+                        MatchType::Path,
+                    );
+                }
             }
         }
 
         let mut results: Vec<SearchResult> = heap.into_iter().map(|r| r.0.result).collect();
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        for r in results.iter_mut() {
+            r.display_path = indexer.display_path_for(r.entry.as_ref());
+        }
 
         results
     }
@@ -206,6 +223,7 @@ impl Searcher {
             tie,
             result: SearchResult {
                 entry: Arc::new(entry.clone()),
+                display_path: String::new(),
                 score: final_score,
                 match_type,
             },
@@ -404,7 +422,6 @@ fn fuzzy_match(haystack: &str, needle: &str) -> Option<FuzzyMatch> {
     let mut current = needle_iter.next()?;
 
     let mut first: Option<usize> = None;
-    let mut last: Option<usize> = None;
     let mut prev: Option<usize> = None;
     let mut gaps: usize = 0;
 
@@ -420,14 +437,13 @@ fn fuzzy_match(haystack: &str, needle: &str) -> Option<FuzzyMatch> {
             gaps += i.saturating_sub(prev_i + 1);
         }
         prev = Some(i);
-        last = Some(i);
 
         if let Some(next) = needle_iter.next() {
             current = next;
         } else {
             return Some(FuzzyMatch {
                 first: first.unwrap_or(i),
-                last: last.unwrap_or(i),
+                last: i,
                 gaps,
             });
         }

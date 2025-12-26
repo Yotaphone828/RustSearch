@@ -19,6 +19,20 @@ const FONT_DATA: &[u8] = include_bytes!("../fonts/noto.ttf");
 const ICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 
 fn main() -> eframe::Result {
+    // 默认尝试以管理员权限运行（用于启用 NTFS 的 USN/MFT 快速枚举）。
+    // 若用户取消 UAC 或请求失败，则继续以普通权限运行并自动回退到 WalkDir 扫描。
+    #[cfg(windows)]
+    {
+        if std::env::var_os("RUSTSEARCH_SKIP_ELEVATE").is_none() {
+            let elevated = crate::windows_usn::is_process_elevated().unwrap_or(false);
+            if !elevated {
+                if crate::windows_usn::relaunch_as_admin().is_ok() {
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
     // 加载图标（如果存在）
     let icon = load_icon();
 

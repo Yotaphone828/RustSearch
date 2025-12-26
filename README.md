@@ -1,9 +1,12 @@
-基于 Rust 开发的 Windows 文件快速搜索器
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/e7b0d75d-6cb0-4368-8a24-031282087c67" alt="Logo" width="120" height="120">
+</p>
 
-作者：Serral
+<h3 align="center">RustSearch</h3>
 
-## v0.1.1
-
-- 优化索引缓存机制（缓存更小，旧缓存自动升级）
-- Windows: 使用 USN Journal 加速全盘枚举（NTFS）
-- Windows: 使用 USN Journal 增量更新（避免频繁全盘扫描）
+<p align="center">
+  基于Rust的windows文件搜索器
+  <br>
+  <a href="https://your-doc-link.com">查看文档</a> ·
+  <a href="https://github.com/your-username/your-repo/issues">报告 Bug</a>
+</p>
